@@ -3,12 +3,19 @@ package firstnonerr
 import (
 	"context"
 	"errors"
+	"math/rand"
 )
 
 var (
 	ErrNonErrNotFound = errors.New("non-error response not found")
+	ErrEmpty          = errors.New("no items to check")
 )
 
+// Returns the first non-error result from a function `checker` applied to each entry in a list of `items`.
+// If the list of items is empty, it returns `ErrEmpty`.
+// If all of the results are errors, it randoms a random error from the error results.
+// There are `concurrent` workers to apple the `checker` function.
+// If `concurrent` is 0, then it will create `len(items)` workers.
 func GetFirstNonError[T, R any](
 	ctx context.Context,
 	items []T,
@@ -18,7 +25,8 @@ func GetFirstNonError[T, R any](
 		concurrent = len(items)
 	}
 	itemCh := make(chan T)
-	badResponsesCh := make(chan struct{})
+	badResponsesCh := make(chan error)
+	randomErrCh := make(chan error)
 	firstValidResponseCh := make(chan R)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -26,11 +34,13 @@ func GetFirstNonError[T, R any](
 		go processItemRequests(ctx, itemCh, badResponsesCh, firstValidResponseCh, checker)
 	}
 	go sendItemRequests(ctx, items, itemCh)
-	go processItemResponses(ctx, items, badResponsesCh, cancel)
+	go processItemResponses(ctx, items, badResponsesCh, randomErrCh)
+	var nilR R
 	select {
 	case <-ctx.Done():
-		var nilR R
 		return nilR, ErrNonErrNotFound
+	case randomErr := <-randomErrCh:
+		return nilR, randomErr
 	case validItem := <-firstValidResponseCh:
 		return validItem, nil
 	}
@@ -52,7 +62,7 @@ func sendItemRequests[T any](
 func processItemRequests[T, R any](
 	ctx context.Context,
 	itemCh <-chan T,
-	badResponsesCh chan<- struct{},
+	badResponsesCh chan<- error,
 	firstValidResponseCh chan<- R,
 	checker func(context.Context, T) (R, error)) {
 	for {
@@ -64,12 +74,15 @@ func processItemRequests[T, R any](
 			if err == nil {
 				select {
 				case <-ctx.Done():
+					return
 				case firstValidResponseCh <- response:
+					return
 				}
 			} else {
 				select {
 				case <-ctx.Done():
-				case badResponsesCh <- struct{}{}:
+					return
+				case badResponsesCh <- err:
 				}
 			}
 		}
@@ -79,14 +92,24 @@ func processItemRequests[T, R any](
 func processItemResponses[T any](
 	ctx context.Context,
 	items []T,
-	badResponsesCh <-chan struct{},
-	cancel context.CancelFunc) {
-	defer cancel()
+	badResponsesCh <-chan error,
+	finalErrorCh chan<- error) {
+	nth := 0.0
+	randomError := ErrEmpty
 	for range items {
+		nth += 1.0
 		select {
 		case <-ctx.Done():
 			return
-		case <-badResponsesCh:
+		case curErr := <-badResponsesCh:
+			if nth*rand.Float64() <= 1.0 {
+				randomError = curErr
+			}
 		}
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case finalErrorCh <- randomError:
 	}
 }
